@@ -7,6 +7,20 @@ import { expandAtImports } from "../discovery/at-imports";
 import { BUILTIN_TOOL_NAMES, normalizeToolNames } from "../tools/builtin-names";
 import { collectConfigCandidates } from "./watchdog";
 
+/** Review cadence for primary transcript updates delivered to one advisor. */
+export type AdvisorReviewMode = "turn" | "agent-end";
+export const ADVISOR_REVIEW_MODES = ["turn", "agent-end"] as const;
+
+/**
+ * Catch-up policy values, mirroring the global `advisor.syncBacklog` setting:
+ * `off` never waits, a numeric threshold waits until fewer than that many
+ * scheduled reviews remain (wall-clock capped), and `strict` waits for all
+ * scheduled reviews without a cap. Single source for the settings schema and
+ * the `WATCHDOG.yml` entry parser.
+ */
+export const ADVISOR_SYNC_BACKLOG_MODES = ["off", "1", "3", "5", "strict"] as const;
+export type AdvisorSyncBacklog = (typeof ADVISOR_SYNC_BACKLOG_MODES)[number];
+
 /**
  * One advisor declared in a `WATCHDOG.yml` file. `model` is a model selector
  * with an optional `:level` thinking suffix (e.g. `x-ai/grok-code-fast:high`),
@@ -22,6 +36,17 @@ export interface AdvisorConfig {
 	name: string;
 	model?: string;
 	tools?: string[];
+	/** Review every primary update, or only final yields. */
+	reviewMode?: AdvisorReviewMode;
+	/** Review every Nth eligible primary update. */
+	reviewInterval?: number;
+	/**
+	 * Per-advisor catch-up policy overriding the global `advisor.syncBacklog`
+	 * setting. Omitted inherits the global value dynamically (resolved at each
+	 * boundary, so live setting changes apply); an explicit `off` opts this
+	 * advisor out of catch-up waits even when the global policy waits.
+	 */
+	syncBacklog?: AdvisorSyncBacklog;
 	instructions?: string;
 	/** Per-advisor on/off toggle (default `true`). When `false`, the advisor
 	 *  stays in the roster but its runtime is never built — it shows `○` in
@@ -29,7 +54,8 @@ export interface AdvisorConfig {
 	enabled?: boolean;
 	/**
 	 * Per-advisor maximum non-blocker advice notes accepted per advisor prompt
-	 * update (default `4`). Blockers are exempt from the budget.
+	 * update (default: the global `advisor.maxNotesPerUpdate` setting).
+	 * Blockers are exempt from the budget.
 	 */
 	maxNotesPerUpdate?: number;
 }
@@ -62,10 +88,25 @@ export interface DiscoveredAdvisors {
 	warnings: string[];
 }
 
+const reviewIntervalSchema = type("1 <= number.integer <= 9007199254740991");
+const syncBacklogSchema = type.enumerated(...ADVISOR_SYNC_BACKLOG_MODES);
+/** Unquoted `syncBacklog: 3` parses as a number; accept the numeric thresholds alongside the string enum. */
+const syncBacklogEntrySchema = type.enumerated(...ADVISOR_SYNC_BACKLOG_MODES, 1, 3, 5);
+const SYNC_BACKLOG_NUMERIC_THRESHOLDS = { 1: "1", 3: "3", 5: "5" } as const;
+
+function normalizeSyncBacklog(
+	value: AdvisorSyncBacklog | keyof typeof SYNC_BACKLOG_NUMERIC_THRESHOLDS,
+): AdvisorSyncBacklog {
+	return typeof value === "number" ? SYNC_BACKLOG_NUMERIC_THRESHOLDS[value] : value;
+}
+
 const advisorEntrySchema = type({
 	name: "string",
 	"model?": "string",
 	"tools?": "string[]",
+	"reviewMode?": "'turn' | 'agent-end'",
+	"reviewInterval?": reviewIntervalSchema,
+	"syncBacklog?": syncBacklogEntrySchema,
 	"instructions?": "string",
 	"enabled?": "boolean",
 	"maxNotesPerUpdate?": "number",
@@ -237,6 +278,9 @@ export async function discoverAdvisorConfigs(cwd: string, agentDir?: string): Pr
 				name: entry.name,
 				model: entry.model?.trim() || undefined,
 				tools: filterAdvisorTools(entry.tools, item.path),
+				reviewMode: entry.reviewMode,
+				reviewInterval: entry.reviewInterval,
+				syncBacklog: entry.syncBacklog === undefined ? undefined : normalizeSyncBacklog(entry.syncBacklog),
 				maxNotesPerUpdate:
 					typeof entry.maxNotesPerUpdate === "number" &&
 					Number.isFinite(entry.maxNotesPerUpdate) &&
@@ -341,6 +385,9 @@ export async function loadWatchdogConfigFile(filePath: string): Promise<Watchdog
 		const advisor: AdvisorConfig = { name: a.name };
 		if (a.model?.trim()) advisor.model = a.model;
 		if (a.tools !== undefined) advisor.tools = [...a.tools];
+		if (a.reviewMode !== undefined) advisor.reviewMode = a.reviewMode;
+		if (a.reviewInterval !== undefined) advisor.reviewInterval = a.reviewInterval;
+		if (a.syncBacklog !== undefined) advisor.syncBacklog = normalizeSyncBacklog(a.syncBacklog);
 		if (a.instructions?.trim()) advisor.instructions = a.instructions;
 		if (a.enabled !== undefined) advisor.enabled = a.enabled;
 		if (typeof a.maxNotesPerUpdate === "number" && Number.isFinite(a.maxNotesPerUpdate) && a.maxNotesPerUpdate >= 1) {
@@ -409,6 +456,11 @@ export function serializeWatchdogConfig(doc: WatchdogConfigDoc): string {
 					}
 				}
 			}
+			if (advisor.reviewMode !== undefined) lines.push(`    reviewMode: ${YAML.stringify(advisor.reviewMode)}`);
+			if (advisor.syncBacklog !== undefined) {
+				syncBacklogSchema.assert(advisor.syncBacklog);
+				lines.push(`    syncBacklog: ${YAML.stringify(advisor.syncBacklog)}`);
+			}
 			if (advisor.instructions?.trim()) {
 				appendYamlString(lines, "    ", "instructions", advisor.instructions);
 			}
@@ -419,6 +471,10 @@ export function serializeWatchdogConfig(doc: WatchdogConfigDoc): string {
 				advisor.maxNotesPerUpdate >= 1
 			) {
 				lines.push(`    maxNotesPerUpdate: ${Math.trunc(advisor.maxNotesPerUpdate)}`);
+			}
+			if (advisor.reviewInterval !== undefined) {
+				reviewIntervalSchema.assert(advisor.reviewInterval);
+				lines.push(`    reviewInterval: ${advisor.reviewInterval}`);
 			}
 		}
 	}
