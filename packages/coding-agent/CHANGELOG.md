@@ -13,6 +13,8 @@
 
 ### Changed
 
+- Advisor acknowledgments distinguish acceptance, deferral, and suppression; higher-priority findings replace only pending notes from the same review.
+- Advisor notes merge at final boundaries with age markers and at most one permitted continuation per batch; advisor continuations no longer trigger recursive reviews.
 - Keyless Parallel web search now leads the default provider chain ahead of Perplexity.
 
 ### Fixed
